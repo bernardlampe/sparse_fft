@@ -1,76 +1,69 @@
 import numpy as np
-
-class SparseFFT:
-    """
-    A practical Sparse FFT implementation based on Hassanieh et al. (2012).
-    Complexity: O(k log N log (N/k))
-    """
-
-    def __init__(self, N, k, num_hashes=4, num_bins=None):
-        self.N = N
-        self.k = k
-        self.num_hashes = num_hashes
-        self.num_bins = num_bins or (1 << (k - 1).bit_length())
-
-    def _permute(self, x, a, b):
-        """Apply random affine permutation and modulation."""
-        N = len(x)
-        n = np.arange(N)
-        idx = (a * n + b) % N
-        phase = np.exp(2j * np.pi * n * np.random.rand())
-        return x[idx] * phase
-
-    def _hash_and_filter(self, x, a, b):
-        """Hash the signal into bins and compute FFT."""
-        permuted = self._permute(x, a, b)
-        subsampled = permuted[::max(1, self.N // self.num_bins)]
-        return np.fft.fft(subsampled, self.num_bins)
-
-    def _estimate_frequencies(self, bins_list):
-        """Estimate frequencies by finding peaks across multiple hashes."""
-        magnitudes = np.stack([np.abs(b) for b in bins_list])
-        avg_mag = np.median(magnitudes, axis=0)
-        top_bins = np.argpartition(avg_mag, -self.k)[-self.k:]
-
-        freqs = []
-        coeffs = []
-        for b_idx in top_bins:
-            values = [bins[b_idx] for bins in bins_list]
-            coeff = np.median(values)
-            freqs.append(b_idx * (self.N // self.num_bins))
-            coeffs.append(coeff)
-
-        return np.array(freqs) % self.N, np.array(coeffs)
-
-    def fit(self, x):
-        """Compute the Sparse FFT estimate of x."""
-        hashes = []
-        for _ in range(self.num_hashes):
-            a = np.random.randint(1, self.N)
-            b = np.random.randint(0, self.N)
-            bins = self._hash_and_filter(x, a, b)
-            hashes.append(bins)
-
-        freqs, coeffs = self._estimate_frequencies(hashes)
-        return freqs, coeffs
+import matplotlib.pyplot as plt
 
 
-# --- Example Usage ---
-if __name__ == "__main__":
-    N = 8192
-    k = 10
-    np.random.seed(42)
-    
-    # Generate k-sparse signal
-    freqs_true = np.random.choice(N // 2, k, replace=False)
-    coeffs_true = np.random.randn(k) + 1j * np.random.randn(k)
-    x = np.zeros(N, dtype=complex)
-    for f, c in zip(freqs_true, coeffs_true):
-        x += c * np.exp(2j * np.pi * f * np.arange(N) / N)
-    
-    # Run Sparse FFT
-    sfft = SparseFFT(N=N, k=k)
-    freqs_est, coeffs_est = sfft.fit(x)
+def sfft(X_sparse, N, K, B=256):
 
-    print("True Frequencies:", sorted(freqs_true))
-    print("Estimated Frequencies:", sorted(freqs_est))
+    # Hashing: randomly permute frequency indices and bin into buckets
+    perm = np.random.permutation(N)
+    bucket_indices = perm % B
+
+    # Filter: apply a flat window (can be replaced with more sophisticated filters)
+    window = np.ones(N)
+
+    # Aliased signal: simulate subsampling in time domain
+    time_indices = np.arange(0, N, N // B)
+    aliased_signal = np.zeros(B, dtype=complex)
+
+    for b in range(B):
+        for i in range(N):
+            if bucket_indices[i] == b:
+                aliased_signal[b] += X_sparse[i] * np.exp(2j * np.pi * i * time_indices[b] / N)
+
+    # Estimate frequencies: identify top buckets and recover frequency indices
+    estimated_freqs = []
+    estimated_values = []
+
+    threshold = np.percentile(np.abs(aliased_signal), 100 * (1 - K / B))
+    for b in range(B):
+        if np.abs(aliased_signal[b]) >= threshold:
+            # Estimate frequency index from bucket
+            candidates = np.where(bucket_indices == b)[0]
+            # Choose the candidate with highest magnitude in original sparse signal
+            best = max(candidates, key=lambda i: np.abs(X_sparse[i]))
+            estimated_freqs.append(best)
+            estimated_values.append(X_sparse[best])
+
+    return estimated_values, estimated_freqs
+
+
+# Parameters
+N = 4096 # Signal length
+K = 20                # Sparsity (number of non-zero frequencies)
+
+# Generate a synthetic sparse signal in frequency domain
+freq_indices = np.random.choice(N, K, replace=False)
+freq_values = np.random.randn(K) + 1j * np.random.randn(K)
+
+# Create sparse frequency domain signal
+X_sparse = np.zeros(N, dtype=complex)
+X_sparse[freq_indices] = freq_values
+
+estimated_values, estimated_freqs = sfft(X_sparse, N, K)
+
+# Display results
+print("Original Frequencies:", sorted(freq_indices))
+print("Estimated Frequencies:", sorted(estimated_freqs))
+
+# Plot frequency domain comparison
+plt.figure(figsize=(10, 5))
+plt.stem(freq_indices, np.abs(X_sparse[freq_indices]), linefmt='b-', markerfmt='bo', basefmt=' ')
+plt.stem(estimated_freqs, np.abs(estimated_values), linefmt='r--', markerfmt='rx', basefmt=' ')
+plt.title("Original vs Estimated Sparse Frequencies")
+plt.xlabel("Frequency Index")
+plt.ylabel("Magnitude")
+plt.legend(["Original", "Estimated"])
+plt.grid(True)
+plt.tight_layout()
+plt.savefig("sparse_fft_comparison.png")
+plt.show()
