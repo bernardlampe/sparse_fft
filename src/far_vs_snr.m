@@ -5,11 +5,9 @@ n = 4096;
 
 % create data set
 data_freq = zeros(n, 1);
-    
-% create k magnitudes at different locations
-for j = 1:k
-    data_freq(randi([1 4096])) = 1; %randi([1 100]);
-end
+
+% create k magnitudes at distinct locations
+data_freq(randperm(n, k)') = 1;
 
 % create time domain data
 data_time = ifft(data_freq) .* n;
@@ -26,12 +24,14 @@ SNRDB = zeros(length(snrs), 1);
 % loop over k
 for i = 1:length(snrs)
     % create complex noise
-    [signalWithNoise, ~, snr] = addNoise(data_time, snrs(i));
+    [signalWithNoise, scaledSignal, snr] = addNoise(data_time, snrs(i));
 
     % run sparse fft
     dft = sfft(signalWithNoise, k);
 
-    dft = dft ./ max(dft);
+    % divide out the signal scaling applied by addNoise
+    scale = scaledSignal(1) / data_time(1);
+    dft = dft / abs(scale);
 
     % SNR
     SNRDB(i) = snr;

@@ -1,16 +1,15 @@
-function sDFT = sfft(data, k)
+function [sDFT, diagnostics] = sfft(data, k)
 
 % Sparse FFT implementation. The sDFT return variable is the estimated
 % k complex values embedded in a n-length vector of n-k zeros.
-
-% The magnitudes are right, but there is a phase shift in the code
-% somewhere. I manually take it out at the end. It's a hack, but it works.
+%
+% Requires n divisible by 64. Reliable for k up to about B/4 = 16;
+% location accuracy degrades as k approaches B because the d*k selected
+% bins cover a growing fraction of [n] and true locations lose their
+% vote-count majority. Raise B (a power of two dividing n) for larger k.
 
 % length of data
 n = length(data);
-
-% heuristic number of times the outer loop runs
-L = ceil(log2(n));
 
 % heuristic size of frequency bin to divide n
 B = 64;
@@ -22,6 +21,15 @@ d = 2;
 stddev = sqrt(50);
 w = 384;
 
+% input validation: the remap and filter geometry require these
+assert(mod(n, B) == 0, 'sfft: n (%d) must be divisible by B (64)', n);
+assert(mod(n, 2) == 0, 'sfft: n (%d) must be even', n);
+assert(k >= 1 && k <= B, 'sfft: k (%d) must be in 1..B (%d)', k, B);
+assert(w <= n, 'sfft: filter length w (%d) must be <= n (%d)', w, n);
+
+% heuristic number of times the outer loop runs
+L = ceil(log2(n));
+
 % filter function return time domain filter and max value of G_hat
 [G, G_hat] = build_filter(B, stddev, w, n);
 
@@ -29,39 +37,63 @@ w = 384;
 
 % 4.2.1 Run location loop L times
 Z = zeros(L, n);
+z_hats = zeros(B, L);
+Js = zeros(min(d*k, B), L);
 for r = 1:L
     % 4.2.1 get the locations
     [J, z_hat, sigma_inv] = location_loop(data, n, G, w, B, d, k);
+    z_hats(:, r) = z_hat;
+    Js(:, r) = J;
     [I, z_vals] = remap_locations(d, k, n, B, sigma_inv, J, z_hat, G_hat);
     Z(r, I) = z_vals;
 end
 
 % 4.2.2 Count the occurences of each location
 bin_counts = sum(Z ~= 0);
+bin_counts = bin_counts(:);
 
-% 4.2.3 Check if the occurences of each location is > L/2
-% We pick the highest k here instead of score > L/2
-[~, bin_inds] = sort(bin_counts, 'descend');
-bin_inds = bin_inds(1:k);
+% 4.2.3 Keep locations with more than L/2 occurrences (paper's rule).
+% Candidates are ranked by vote count first; ties in the vote count are
+% broken by the magnitude of the median estimate, so at most k locations
+% survive when the threshold passes too many.
+candidates = find(bin_counts > L/2);
+if isempty(candidates)
+    % no location passed the threshold; fall back to top-k by vote count
+    [~, candidates] = sort(bin_counts, 'descend');
+    candidates = candidates(1:k);
+elseif numel(candidates) > k
+    % rank by vote count, then by median estimate magnitude
+    mags = zeros(numel(candidates), 1);
+    for c = 1:numel(candidates)
+        col = Z(:, candidates(c));
+        col = col(col ~= 0);
+        mags(c) = abs(median(col));
+    end
+    [~, order] = sortrows([-bin_counts(candidates(:)), -mags], [1, 2]);
+    candidates = candidates(order(1:k));
+end
+bin_inds = candidates;
+
+% diagnostics: per-location vote counts, the per-run subsampled FFTs with
+% their voted bins, the vote matrix used for the estimation medians, and
+% the loop parameters
+diagnostics = struct('vote_counts', bin_counts, 'Z', Z, ...
+    'z_hats', z_hats, 'Js', Js, 'L', L, 'B', B, 'd', d);
 
 % 4.2.4 Run estimation loop L times on location that have > L/2 occurrences
 % 4.2.5 Use median of complex values as estimate at each location
 sDFT = zeros(n, 1);
-for k = 1:length(bin_inds)
-    b = bin_inds(k);
-    re = real(Z(:, b));
-    im = imag(Z(:, b));
-    re = median(re);
-    im = median(im);
+for kk = 1:length(bin_inds)
+    b = bin_inds(kk);
 
-    % FIXME: Correcting for a phase shift bug earlier in the code
-    b = mod(n - b + 1, n) + 1;
-    num = re + im * 1i;
-    a = angle(num) + 0.296108836078530;
-    m = abs(num);
-    num = m * exp(a * 1i);
+    % median over rows that actually voted for this location
+    col = Z(:, b);
+    col = col(col ~= 0);
+    if isempty(col)
+        continue;
+    end
 
-    sDFT(b) = num;
+    sDFT(b) = median(real(col)) + 1i * median(imag(col));
 end
 
 end
@@ -73,25 +105,29 @@ function [I, Z] = remap_locations(d, k, n, B, sigma_inv, J, z_hat, G_hat)
 
     m = 1;
     for i = 1:length(J)
-        % compute lowest and highest bin values in [n]
-        low = mod(ceil((J(i) - 1 - 0.5) * n / B), n);
-        high = mod(ceil((J(i) - 1 + 0.5) * n / B), n);
+        % bin J(i) covers the n/B frequency slots starting half a bin below
+        % the bin center: j = (J(i) - 1.5) * n/B + t, t = 0..n/B-1
+        low = mod(round((J(i) - 1.5) * n / B), n);
 
-        % each index in J maps to B indicies in [n]
-        j = low;
-        l = 1;
-        while j ~= high
+        % each index in J maps to n/B indicies in [n]
+        for t = 0:n/B-1
+            j = mod(low + t, n);
+
             % transform the index back
             I(m) = mod(j * sigma_inv, n) + 1;
 
             % compute the x estimate value
-            Z(m) = z_hat(J(i)) ./ G_hat(l);
+            % the alias-folded tone contributes c * conj(G_hat(l)), so the
+            % estimate needs the conjugate of the filter response
+            Z(m) = z_hat(J(i)) ./ conj(G_hat(t + 1));
 
             m = m + 1;
-            l = l + 1;
-            j = mod(j + 1, n);
         end
     end
+
+    % trim to the number of votes actually written
+    I = I(1:m-1);
+    Z = Z(1:m-1);
 end
 
 % 4.1 Inner loop
@@ -105,7 +141,7 @@ function [J, z_hat, sigma_inv] = location_loop(x, n, G, w, B, d, k)
     % get sigma inverse
     [~, sigma_inv] = gcd(sigma, n);
     sigma_inv = mod(sigma_inv, n);
-  
+
     % check that we have a valid sigma
     assert(mod(sigma * sigma_inv, n) == 1, 'sigma not relatively prime with n');
 
@@ -126,47 +162,8 @@ function [J, z_hat, sigma_inv] = location_loop(x, n, G, w, B, d, k)
     end
     z_hat = fft(z, B);
 
-    % FIXME: Correcting for a phase shift error earlier in the code
-    z_hat = circshift(flipud(z_hat), 1);
-    
     % find dk indicies in B with largest magnitude
     [~, J] = sort(abs(z_hat), 'descend');
-    J = J(1:d*k);
+    J = J(1:min(d*k, B));
 end
 
-% Make a time domain filter length w with supp \in 2*B in frequency domain
-function [G, G_hat] = build_filter(B, stddev, w, n)
-    % boxcar length is twice the B
-    box_length = floor(2 * B * 0.8);
-
-    % boxcar
-    g_boxcar = zeros(n, 1);
-    g_boxcar((n-box_length)/2:(n+box_length)/2) = 1;
-
-    % gaussian
-    g_x = (0:n-1) - n/2;
-    g_gauss = exp(-g_x.^2 / (2 * stddev * stddev))';
-
-    % convolve the gaussian and boxcar
-    g_conv = conv(g_boxcar, g_gauss, 'same');
-
-    % normalize filters
-    g_conv = g_conv ./ max(g_conv);
-
-    % center at DC
-    g_conv = circshift(g_conv, n/2+1);
-
-    % ifft
-    g_time = fftshift(ifft(g_conv, n));
-
-    % truncate
-    n_g = length(g_time);
-    G = real(g_time(ceil((n_g - w)/2):ceil((n_g + w)/2)-1));
-
-    % compute the fft of G_hat for the esimation step
-    G_hat = fftshift(fft(G, n));
-
-    % subset the frequency domain filter
-    n_g = length(G_hat);
-    G_hat = G_hat(ceil((n_g - B)/2):ceil((n_g + B)/2)-1);
-end

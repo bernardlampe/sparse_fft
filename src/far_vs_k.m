@@ -10,13 +10,10 @@ FN = zeros(maxk, 1);
 
 % loop over k
 for k = 1:maxk
-    % create data set
+    % create data set with k distinct locations
     data_freq = zeros(n, 1);
-    
-    % create k magnitudes at different locations
-    for j = 1:k
-        data_freq(randi([1 4096])) = 1; %randi([1 100]);
-    end
+    data_freq(randperm(n, k)') = 1;
+
 
     % create time domain data
     data_time = ifft(data_freq) .* n;
